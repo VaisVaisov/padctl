@@ -121,12 +121,22 @@ curl -fLO https://github.com/BANANASJIM/padctl/releases/latest/download/padctl_a
 sudo dpkg -i padctl_arm64.deb
 ```
 
-After installing via a package manager, enable the user service from your normal
-login session:
+Package installs place files on disk; they do not run the live `padctl install`
+phase. Enable the user service from your normal login session:
 
 ```sh
 systemctl --user daemon-reload
 systemctl --user enable --now padctl.service
+sudo udevadm control --reload-rules
+```
+
+If your controller config uses `block_kernel_drivers` (currently Flydigi Vader
+5), also enable padctl's driver-block sentinel and then unplug/replug the
+controller:
+
+```sh
+sudo install -d -m 0755 /etc/padctl
+printf 'padctl service-enabled sentinel v1\nprefix=/usr\nwritten-by=package-manager setup\n' | sudo tee /etc/padctl/service-enabled >/dev/null
 ```
 
 ### From Source
