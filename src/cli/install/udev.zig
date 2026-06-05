@@ -291,26 +291,56 @@ pub fn installUdevRules(allocator: std.mem.Allocator, plan: *const InstallPlan, 
         _ = std.posix.write(std.posix.STDERR_FILENO, msg) catch {};
     };
 
-    // Evict already-attached devices without waiting for reboot.
-    // udevadm trigger only sends add events; bind rules fire on the next
-    // plug cycle. Proactively writing to sysfs unbind covers devices that
-    // are already claimed by a blocking driver at install time — but only
-    // when this install actually starts a runnable service,
-    // otherwise an unbound device would be left ownerless.
+    // Re-probe interfaces left driverless by an earlier install whose block
+    // list this install no longer covers, BEFORE evicting currently-blocked
+    // drivers. udevadm trigger only re-runs rules; it does not make the kernel
+    // re-evaluate drivers for an already-attached device, so a previously
+    // unbound interface stays ownerless until replug. Running reprobe first
+    // means it only ever rebinds interfaces that are already driverless and
+    // skips bound ones, so it never re-binds a driver the unbind step below is
+    // about to evict. Not gated by shouldProactiveUnbind so it still recovers
+    // when the block list is empty/reduced.
+    if (!plan.staging_mode and plan.is_root) {
+        probeAndReprobeDrivers(allocator, entries, "");
+    }
+
+    // Evict already-attached devices without waiting for reboot. udevadm
+    // trigger only sends add events; bind rules fire on the next plug cycle.
+    // Proactively writing to sysfs unbind covers devices already claimed by a
+    // blocking driver at install time — but only when this install actually
+    // starts a runnable service, otherwise an unbound device is left ownerless.
+    // Runs last so the eviction is authoritative over the reprobe above.
     if (!plan.staging_mode and plan.is_root and shouldProactiveUnbind(plan)) {
         probeAndUnbindDrivers(allocator, entries, "");
     }
 }
 
 pub fn cleanupLegacyUdevFiles(allocator: std.mem.Allocator, plan: *const InstallPlan) !void {
-    // Legacy 99-padctl.rules was renamed to 60- for correct priority.
-    const legacy = try std.fmt.allocPrint(allocator, "{s}{s}/lib/udev/rules.d/99-padctl.rules", .{ plan.opts.destdir, plan.prefix });
-    defer allocator.free(legacy);
-    std.fs.deleteFileAbsolute(legacy) catch {};
+    // padctl rules live in two trees: {prefix}/lib/udev/rules.d (normal) and
+    // /etc/udev/rules.d (immutable). /etc shadows /usr/lib, so a leftover rule in
+    // the non-active tree silently overrides the freshly written one after a mode
+    // switch. Sweep every padctl basename from whichever tree is NOT the active
+    // one; the std.mem.eql guard ensures the just-written rules are never deleted.
+    // 99-padctl.rules is the historical 60- name, kept here for upgrade hygiene.
+    const basenames = [_][]const u8{
+        "60-padctl.rules",
+        "61-padctl-driver-block.rules",
+        "90-padctl.rules",
+        "99-padctl.rules",
+    };
+    const etc_dir = try std.fmt.allocPrint(allocator, "{s}/etc/udev/rules.d", .{plan.opts.destdir});
+    defer allocator.free(etc_dir);
+    const lib_dir = try std.fmt.allocPrint(allocator, "{s}{s}/lib/udev/rules.d", .{ plan.opts.destdir, plan.prefix });
+    defer allocator.free(lib_dir);
 
-    const legacy_etc = try std.fmt.allocPrint(allocator, "{s}/etc/udev/rules.d/99-padctl.rules", .{plan.opts.destdir});
-    defer allocator.free(legacy_etc);
-    std.fs.deleteFileAbsolute(legacy_etc) catch {};
+    for ([_][]const u8{ etc_dir, lib_dir }) |dir| {
+        if (std.mem.eql(u8, dir, plan.udev_dir)) continue;
+        for (basenames) |name| {
+            const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir, name });
+            defer allocator.free(path);
+            std.fs.deleteFileAbsolute(path) catch {};
+        }
+    }
 }
 
 /// Scan all device TOML files in dirs, extract VID/PID/name/block_kernel_drivers,
@@ -708,6 +738,103 @@ fn rebindInterfaces(
         } else |err| {
             std.log.warn("could not rebind {s} to kernel driver '{s}' (replug or run `modprobe {s}` to restore it): {}", .{ child.name, driver, driver, err });
         }
+    }
+}
+
+/// Walk <sys_root>/sys/bus/usb/devices/ and, for any USB device whose
+/// idVendor:idProduct matches an entry, ask the kernel to re-probe every
+/// interface child that currently has no `driver` symlink by writing its name
+/// to the global <sys_root>/sys/bus/usb/drivers_probe. The kernel selects the
+/// correct driver from the descriptor, so no driver name is hard-coded.
+/// Best-effort: catch+continue on every fs error; silent no-op when the tree is
+/// absent or non-root. `sys_root` is "" in production; tests inject a tmpDir.
+pub fn probeAndReprobeDrivers(allocator: std.mem.Allocator, entries: []const UdevEntry, sys_root: []const u8) void {
+    const devices_path = std.fmt.allocPrint(
+        allocator,
+        "{s}/sys/bus/usb/devices",
+        .{sys_root},
+    ) catch return;
+    defer allocator.free(devices_path);
+
+    var devices_dir = std.fs.openDirAbsolute(devices_path, .{ .iterate = true }) catch return;
+    defer devices_dir.close();
+
+    const probe_path = std.fmt.allocPrint(
+        allocator,
+        "{s}/sys/bus/usb/drivers_probe",
+        .{sys_root},
+    ) catch return;
+    defer allocator.free(probe_path);
+
+    for (entries) |entry| {
+        var it = devices_dir.iterate();
+        while (it.next() catch null) |de| {
+            if (de.kind != .sym_link and de.kind != .directory) continue;
+            if (de.name.len == 0 or de.name[0] < '0' or de.name[0] > '9') continue;
+            // Skip interface nodes ("1-1.4:1.0"); only match top-level devices.
+            if (std.mem.indexOfScalar(u8, de.name, ':') != null) continue;
+
+            const vendor_path = std.fmt.allocPrint(
+                allocator,
+                "{s}/sys/bus/usb/devices/{s}/idVendor",
+                .{ sys_root, de.name },
+            ) catch continue;
+            defer allocator.free(vendor_path);
+
+            const product_path = std.fmt.allocPrint(
+                allocator,
+                "{s}/sys/bus/usb/devices/{s}/idProduct",
+                .{ sys_root, de.name },
+            ) catch continue;
+            defer allocator.free(product_path);
+
+            const vid = readSysHex(vendor_path) catch continue;
+            const pid = readSysHex(product_path) catch continue;
+            if (vid != entry.vid or pid != entry.pid) continue;
+
+            reprobeInterfaces(allocator, sys_root, de.name, probe_path);
+        }
+    }
+}
+
+/// For each interface child of USB device `dev_name` ("<dev_name>:N.M") that has
+/// no `driver` symlink, write its name to the global `drivers_probe` attribute.
+fn reprobeInterfaces(
+    allocator: std.mem.Allocator,
+    sys_root: []const u8,
+    dev_name: []const u8,
+    probe_path: []const u8,
+) void {
+    const dev_dir_path = std.fmt.allocPrint(
+        allocator,
+        "{s}/sys/bus/usb/devices/{s}",
+        .{ sys_root, dev_name },
+    ) catch return;
+    defer allocator.free(dev_dir_path);
+
+    var dev_dir = std.fs.openDirAbsolute(dev_dir_path, .{ .iterate = true }) catch return;
+    defer dev_dir.close();
+
+    var it = dev_dir.iterate();
+    while (it.next() catch null) |child| {
+        if (child.kind != .directory and child.kind != .sym_link) continue;
+        if (!std.mem.startsWith(u8, child.name, dev_name)) continue;
+        if (child.name.len <= dev_name.len or child.name[dev_name.len] != ':') continue;
+
+        const driver_link = std.fmt.allocPrint(
+            allocator,
+            "{s}/sys/bus/usb/devices/{s}/{s}/driver",
+            .{ sys_root, dev_name, child.name },
+        ) catch continue;
+        defer allocator.free(driver_link);
+
+        // Already bound to some driver — nothing to re-probe.
+        if (std.fs.accessAbsolute(driver_link, .{})) |_| continue else |_| {}
+
+        if (std.fs.openFileAbsolute(probe_path, .{ .mode = .write_only })) |f| {
+            defer f.close();
+            f.writeAll(child.name) catch {};
+        } else |_| {}
     }
 }
 
