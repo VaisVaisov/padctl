@@ -32,7 +32,73 @@ pub const ScanEntry = struct {
     phys: []const u8,
     config_path: ?[]const u8,
     interface_id: ?u8 = null,
+    access_denied: bool = false,
 };
+
+pub const UeventInfo = struct {
+    vid: u16,
+    pid: u16,
+    name: []const u8,
+};
+
+/// Parse HID_ID/HID_NAME from a hidraw device uevent, so a node's identity is
+/// readable without opening it. `name` aliases `content`.
+pub fn parseHidrawUevent(content: []const u8) ?UeventInfo {
+    var info: UeventInfo = .{ .vid = 0, .pid = 0, .name = "" };
+    var have_id = false;
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trimRight(u8, raw, "\r");
+        if (std.mem.startsWith(u8, line, "HID_ID=")) {
+            var parts = std.mem.splitScalar(u8, line["HID_ID=".len..], ':');
+            _ = parts.next();
+            const vid_s = parts.next() orelse continue;
+            const pid_s = parts.next() orelse continue;
+            const vid = std.fmt.parseInt(u32, vid_s, 16) catch continue;
+            const pid = std.fmt.parseInt(u32, pid_s, 16) catch continue;
+            info.vid = @truncate(vid);
+            info.pid = @truncate(pid);
+            have_id = true;
+        } else if (std.mem.startsWith(u8, line, "HID_NAME=")) {
+            info.name = line["HID_NAME=".len..];
+        }
+    }
+    return if (have_id) info else null;
+}
+
+/// Build an entry for a node that exists but cannot be opened, using the
+/// world-readable sysfs uevent for identity.
+fn accessDeniedEntry(allocator: std.mem.Allocator, config_dir: []const u8, path: []const u8) !?ScanEntry {
+    var uevent_path_buf: [256]u8 = undefined;
+    const uevent_path = std.fmt.bufPrint(&uevent_path_buf, "/sys/class/hidraw/{s}/device/uevent", .{std.fs.path.basename(path)}) catch return null;
+    const content = std.fs.cwd().readFileAlloc(allocator, uevent_path, 8192) catch |err| {
+        std.log.warn("scan: cannot identify denied node {s}: {}", .{ path, err });
+        return null;
+    };
+    defer allocator.free(content);
+    const info = parseHidrawUevent(content) orelse {
+        std.log.warn("scan: cannot identify denied node {s}: no HID_ID in uevent", .{path});
+        return null;
+    };
+
+    const owned_path = try allocator.dupe(u8, path);
+    errdefer allocator.free(owned_path);
+    const name = try allocator.dupe(u8, info.name);
+    errdefer allocator.free(name);
+    const phys = readPhysicalPath(allocator, path) catch try allocator.dupe(u8, "");
+    errdefer allocator.free(phys);
+    const iface_id = readInterfaceId(path);
+    return .{
+        .path = owned_path,
+        .vid = info.vid,
+        .pid = info.pid,
+        .name = name,
+        .phys = phys,
+        .config_path = findConfig(allocator, config_dir, info.vid, info.pid, iface_id) catch null,
+        .interface_id = iface_id,
+        .access_denied = true,
+    };
+}
 
 /// Enumerate /dev/hidrawN, match against *.toml with interface filtering.
 /// Caller owns result; call freeEntries() when done.
@@ -43,7 +109,6 @@ pub fn scan(allocator: std.mem.Allocator, config_dir: []const u8) ![]ScanEntry {
         entries.deinit(allocator);
     }
 
-    var access_denied_hint_shown = false;
     var i: u8 = 0;
     while (i < MAX_HIDRAW) : (i += 1) {
         var path_buf: [32]u8 = undefined;
@@ -52,9 +117,11 @@ pub fn scan(allocator: std.mem.Allocator, config_dir: []const u8) ![]ScanEntry {
         const fd = posix.open(path, .{ .ACCMODE = .RDONLY, .NONBLOCK = true }, 0) catch |err| switch (err) {
             error.FileNotFound => continue,
             error.AccessDenied => {
-                if (!access_denied_hint_shown) {
-                    std.log.warn("scan: permission denied on {s} — run with sudo or add yourself to the 'input' group", .{path});
-                    access_denied_hint_shown = true;
+                if (accessDeniedEntry(allocator, config_dir, path) catch null) |e| {
+                    entries.append(allocator, e) catch |aerr| {
+                        freeEntry(allocator, e);
+                        return aerr;
+                    };
                 }
                 continue;
             },
@@ -103,20 +170,26 @@ pub fn scan(allocator: std.mem.Allocator, config_dir: []const u8) ![]ScanEntry {
         });
     }
 
-    // Suppress unmatched sibling interfaces of matched physical devices.
-    // If any hidraw node for a physical device matched a config, hide the
-    // unmatched siblings sharing the same physical path.
+    suppressUnmatchedSiblings(allocator, &entries);
+
+    return entries.toOwnedSlice(allocator);
+}
+
+/// Suppress unmatched sibling interfaces of matched physical devices: if any
+/// hidraw node for a physical device matched a config, hide the unmatched
+/// siblings sharing the same physical path. Access-denied siblings stay
+/// visible so denied-node counts remain accurate.
+fn suppressUnmatchedSiblings(allocator: std.mem.Allocator, entries: *std.ArrayList(ScanEntry)) void {
     for (entries.items) |e| {
         if (e.config_path != null and e.phys.len > 0) {
             for (entries.items) |*other| {
-                if (other.config_path == null and std.mem.eql(u8, other.phys, e.phys)) {
+                if (other.config_path == null and !other.access_denied and std.mem.eql(u8, other.phys, e.phys)) {
                     other.config_path = ""; // sentinel: suppress but don't show
                 }
             }
         }
     }
 
-    // Remove suppressed entries (sentinel config_path == "")
     var keep: usize = 0;
     for (entries.items) |e| {
         if (e.config_path) |cp| {
@@ -132,8 +205,6 @@ pub fn scan(allocator: std.mem.Allocator, config_dir: []const u8) ![]ScanEntry {
         keep += 1;
     }
     entries.shrinkRetainingCapacity(keep);
-
-    return entries.toOwnedSlice(allocator);
 }
 
 pub fn findConfig(allocator: std.mem.Allocator, config_dir: []const u8, vid: u16, pid: u16, iface_id: ?u8) ![]const u8 {
@@ -202,6 +273,26 @@ fn tomlMatchesVidPid(allocator: std.mem.Allocator, path: []const u8, vid: u16, p
     return matchInterfaceId(content, iface_id);
 }
 
+/// First `id = <n>` value in one [[device.interface]] section body.
+fn sectionInterfaceId(after: []const u8) ?u8 {
+    var lines = std.mem.splitScalar(u8, after, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trimLeft(u8, line, " \t");
+        if (trimmed.len == 0) continue;
+        if (trimmed[0] == '[') break; // next section
+        if (trimmed[0] == '#') continue;
+        if (!std.mem.startsWith(u8, trimmed, "id")) continue;
+        const rest = std.mem.trimLeft(u8, trimmed["id".len..], " \t");
+        if (rest.len == 0 or rest[0] != '=') continue;
+        const val_str = std.mem.trimLeft(u8, rest[1..], " \t");
+        var end: usize = 0;
+        while (end < val_str.len and std.ascii.isDigit(val_str[end])) end += 1;
+        if (end == 0) continue;
+        return std.fmt.parseInt(u8, val_str[0..end], 10) catch continue;
+    }
+    return null;
+}
+
 /// Check whether TOML content has a [[device.interface]] section whose id matches target.
 /// Returns null if no [[device.interface]] sections exist (no constraint),
 /// true if any section's id matches target, false otherwise.
@@ -211,28 +302,30 @@ fn configHasInterfaceId(content: []const u8, target: u8) ?bool {
     var pos: usize = 0;
     while (std.mem.indexOfPos(u8, content, pos, marker)) |idx| {
         found_any = true;
-        const after = content[idx + marker.len ..];
-        var lines = std.mem.splitScalar(u8, after, '\n');
-        while (lines.next()) |line| {
-            const trimmed = std.mem.trimLeft(u8, line, " \t");
-            if (trimmed.len == 0) continue;
-            if (trimmed[0] == '[') break; // next section
-            if (trimmed[0] == '#') continue;
-            if (!std.mem.startsWith(u8, trimmed, "id")) continue;
-            const rest = std.mem.trimLeft(u8, trimmed["id".len..], " \t");
-            if (rest.len == 0 or rest[0] != '=') continue;
-            const val_str = std.mem.trimLeft(u8, rest[1..], " \t");
-            var end: usize = 0;
-            while (end < val_str.len and std.ascii.isDigit(val_str[end])) end += 1;
-            if (end == 0) continue;
-            const parsed = std.fmt.parseInt(u8, val_str[0..end], 10) catch continue;
-            if (parsed == target) return true;
-            break; // found id for this section, move to next
+        if (sectionInterfaceId(content[idx + marker.len ..])) |id| {
+            if (id == target) return true;
         }
         pos = idx + marker.len;
     }
     if (!found_any) return null;
     return false;
+}
+
+/// Bitmask of [[device.interface]] ids declared in TOML content (ids above 63
+/// share the top bit). Null when no interface sections exist (matches any).
+pub fn interfaceIdMask(content: []const u8) ?u64 {
+    const marker = "[[device.interface]]";
+    var mask: u64 = 0;
+    var found_any = false;
+    var pos: usize = 0;
+    while (std.mem.indexOfPos(u8, content, pos, marker)) |idx| {
+        found_any = true;
+        if (sectionInterfaceId(content[idx + marker.len ..])) |id| {
+            mask |= @as(u64, 1) << @intCast(@min(id, 63));
+        }
+        pos = idx + marker.len;
+    }
+    return if (found_any) mask else null;
 }
 
 /// Match device interface id against config's [[device.interface]] sections.
@@ -372,8 +465,10 @@ fn visibleInHidraw(d: StatusDevice, entries: []const ScanEntry) bool {
 
 /// Render scan results. Daemon-managed devices whose hidraw nodes are gone
 /// (the libusb claim detached the kernel driver) are merged in as
-/// "(claimed by padctl)" rows, deduplicated by vid:pid.
-fn render(writer: anytype, entries: []const ScanEntry, daemon_devices: []const StatusDevice) !void {
+/// "(claimed by padctl)" rows, deduplicated by vid:pid. A single permission
+/// warning covers all access-denied nodes regardless of how many config dirs
+/// were scanned.
+pub fn render(writer: anytype, entries: []const ScanEntry, daemon_devices: []const StatusDevice) !void {
     var claimed: usize = 0;
     for (daemon_devices) |d| {
         if (!visibleInHidraw(d, entries)) claimed += 1;
@@ -436,6 +531,15 @@ fn render(writer: anytype, entries: []const ScanEntry, daemon_devices: []const S
         entries.len - unmatched + claimed,
         unmatched,
     });
+
+    var denied: usize = 0;
+    for (entries) |e| {
+        if (e.access_denied) denied += 1;
+    }
+    if (denied > 0) {
+        try writer.print("\nwarning: permission denied opening {d} hidraw node(s)\n", .{denied});
+        try writer.writeAll("hint: sudo usermod -aG input $USER && re-login (or replug to apply udev rules)\n");
+    }
 
     if (unmatched > 0) {
         try writer.writeByte('\n');
@@ -540,6 +644,57 @@ test "scan: matchInterfaceId: with constraint and known iface" {
 test "scan: matchInterfaceId: with constraint and null iface returns false" {
     const toml = "[[device.interface]]\nid = 2\n";
     try std.testing.expectEqual(@as(?bool, false), matchInterfaceId(toml, null));
+}
+
+test "scan: interfaceIdMask: no sections is null, ids become bits" {
+    try std.testing.expectEqual(@as(?u64, null), interfaceIdMask("[device]\nvid = 0x1234\n"));
+    try std.testing.expectEqual(@as(?u64, 1 << 2), interfaceIdMask("[[device.interface]]\nid = 2\n"));
+    try std.testing.expectEqual(
+        @as(?u64, (1 << 0) | (1 << 2)),
+        interfaceIdMask("[[device.interface]]\nid = 0\n\n[[device.interface]]\nid = 2\n"),
+    );
+}
+
+test "scan: suppressUnmatchedSiblings keeps access-denied siblings visible" {
+    const allocator = std.testing.allocator;
+    var entries: std.ArrayList(ScanEntry) = .{};
+    defer {
+        for (entries.items) |e| freeEntry(allocator, e);
+        entries.deinit(allocator);
+    }
+    const phys = "usb-0000:10:00.0-3";
+    try entries.append(allocator, .{
+        .path = try allocator.dupe(u8, "/dev/hidraw0"),
+        .vid = 0x37d7,
+        .pid = 0x2401,
+        .name = try allocator.dupe(u8, "pad"),
+        .phys = try allocator.dupe(u8, phys),
+        .config_path = try allocator.dupe(u8, "devices/pad.toml"),
+    });
+    try entries.append(allocator, .{
+        .path = try allocator.dupe(u8, "/dev/hidraw1"),
+        .vid = 0x37d7,
+        .pid = 0x2401,
+        .name = try allocator.dupe(u8, "pad"),
+        .phys = try allocator.dupe(u8, phys),
+        .config_path = null,
+    });
+    try entries.append(allocator, .{
+        .path = try allocator.dupe(u8, "/dev/hidraw2"),
+        .vid = 0x37d7,
+        .pid = 0x2401,
+        .name = try allocator.dupe(u8, "pad"),
+        .phys = try allocator.dupe(u8, phys),
+        .config_path = null,
+        .access_denied = true,
+    });
+
+    suppressUnmatchedSiblings(allocator, &entries);
+
+    try std.testing.expectEqual(@as(usize, 2), entries.items.len);
+    try std.testing.expectEqualStrings("/dev/hidraw0", entries.items[0].path);
+    try std.testing.expectEqualStrings("/dev/hidraw2", entries.items[1].path);
+    try std.testing.expect(entries.items[1].access_denied);
 }
 
 test "scan: freeEntries: empty slice is a no-op" {

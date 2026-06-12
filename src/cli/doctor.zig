@@ -3,6 +3,7 @@ const posix = std.posix;
 const socket_client = @import("socket_client.zig");
 const udev = @import("install/udev.zig");
 const scan = @import("scan.zig");
+const toml_extract = @import("toml_extract.zig");
 const paths = @import("../config/paths.zig");
 
 pub const StatusDevice = socket_client.StatusDevice;
@@ -352,6 +353,22 @@ pub fn resolveDoctorDeviceDirs(allocator: std.mem.Allocator, exec_start: ?[]cons
     return dirs.toOwnedSlice(allocator);
 }
 
+/// Directories in the order the daemon actually resolves device configs: the
+/// unit's --config-dir alone when set (the daemon ignores all other dirs),
+/// otherwise the default user-first search path the bare daemon walks.
+/// Caller owns the returned slice and each element.
+pub fn resolveDaemonConfigDirs(allocator: std.mem.Allocator, exec_start: ?[]const u8) ![][]const u8 {
+    if (exec_start) |es| {
+        if (configDirFromExecStart(es)) |cfg| {
+            const dirs = try allocator.alloc([]const u8, 1);
+            errdefer allocator.free(dirs);
+            dirs[0] = try allocator.dupe(u8, cfg);
+            return dirs;
+        }
+    }
+    return paths.resolveDeviceConfigDirs(allocator);
+}
+
 /// Query the live padctl.service ExecStart so doctor scans the same device dir
 /// the daemon was launched with. Best-effort: returns null on any failure.
 fn queryServiceExecStart(allocator: std.mem.Allocator) ?[]u8 {
@@ -373,6 +390,160 @@ fn firstExistingDir(dirs: []const []const u8) []const u8 {
         return d;
     }
     return dirs[0];
+}
+
+pub const ConfigMatch = struct {
+    path: []const u8,
+    iface_mask: ?u64,
+};
+
+/// Every device TOML matching vid:pid across `dirs`, in resolution order; the
+/// first element is the file that wins. Caller owns the slice and the paths.
+pub fn collectConfigMatches(allocator: std.mem.Allocator, dirs: []const []const u8, vid: u16, pid: u16) ![]ConfigMatch {
+    var matches: std.ArrayList(ConfigMatch) = .{};
+    errdefer {
+        for (matches.items) |m| allocator.free(m.path);
+        matches.deinit(allocator);
+    }
+    for (dirs) |devices_dir| {
+        var dir = std.fs.openDirAbsolute(devices_dir, .{ .iterate = true }) catch continue;
+        defer dir.close();
+        var walker = dir.walk(allocator) catch continue;
+        defer walker.deinit();
+        while (walker.next() catch null) |we| {
+            if (we.kind != .file or !std.mem.endsWith(u8, we.basename, ".toml")) continue;
+            if (std.mem.startsWith(u8, we.path, "example/")) continue;
+            const full = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ devices_dir, we.path });
+            errdefer allocator.free(full);
+            const content = std.fs.cwd().readFileAlloc(allocator, full, 1 << 20) catch {
+                allocator.free(full);
+                continue;
+            };
+            defer allocator.free(content);
+            const dev = (toml_extract.extractDeviceVidPid(allocator, content) catch null) orelse {
+                allocator.free(full);
+                continue;
+            };
+            toml_extract.freeDeviceInfo(allocator, dev);
+            if (dev.vid == vid and dev.pid == pid) {
+                try matches.append(allocator, .{ .path = full, .iface_mask = scan.interfaceIdMask(content) });
+            } else {
+                allocator.free(full);
+            }
+        }
+    }
+    return matches.toOwnedSlice(allocator);
+}
+
+pub fn freeConfigMatches(allocator: std.mem.Allocator, matches: []ConfigMatch) void {
+    for (matches) |m| allocator.free(m.path);
+    allocator.free(matches);
+}
+
+fn ifaceOverlap(a: ?u64, b: ?u64) bool {
+    const am = a orelse return true;
+    const bm = b orelse return true;
+    return (am & bm) != 0;
+}
+
+fn firstOverlapping(matches: []const ConfigMatch, idx: usize) ?usize {
+    for (matches[0..idx], 0..) |prev, k| {
+        if (ifaceOverlap(prev.iface_mask, matches[idx].iface_mask)) return k;
+    }
+    return null;
+}
+
+/// Print which device TOML wins, flagging files it shadows. Files constrained
+/// to disjoint interfaces are co-active and each get their own line.
+pub fn printProvenance(writer: anytype, matches: []const ConfigMatch) !void {
+    for (matches, 0..) |m, i| {
+        if (firstOverlapping(matches, i) != null) continue;
+        try writer.print("  config: {s}", .{m.path});
+        var open = false;
+        for (matches[i + 1 ..], i + 1..) |later, j| {
+            const winner = firstOverlapping(matches, j) orelse continue;
+            if (winner != i) continue;
+            try writer.writeAll(if (open) " " else " (OVERRIDES ");
+            try writer.print("{s}", .{later.path});
+            open = true;
+        }
+        if (open) try writer.writeByte(')');
+        try writer.writeByte('\n');
+    }
+}
+
+pub fn printHidrawDiagnosis(writer: anytype, path: ?[]const u8, access_denied: bool) !void {
+    const p = path orelse {
+        try writer.writeAll("  hidraw: none\n");
+        return;
+    };
+    if (access_denied) {
+        try writer.print("  hidraw: {s} exists but permission denied (mode/owner; you are not in the input group)\n", .{p});
+        try writer.writeAll("  hint: sudo usermod -aG input $USER && re-login (or replug to apply udev rules)\n");
+    } else {
+        try writer.print("  hidraw: {s}\n", .{p});
+    }
+}
+
+/// First interface bound to a known gamepad driver (xpad or the device's
+/// block_kernel_drivers list). usbhid is never flagged: hidraw-backed devices
+/// legitimately keep it bound.
+pub fn findFlaggedShadow(interfaces: []const UsbInterface, block_drivers: []const []const u8) ?UsbInterface {
+    for (interfaces) |iface| {
+        const d = iface.driver orelse continue;
+        if (std.mem.eql(u8, d, "usbhid")) continue;
+        if (std.mem.eql(u8, d, "xpad")) return iface;
+        for (block_drivers) |b| {
+            if (std.mem.eql(u8, d, b)) return iface;
+        }
+    }
+    return null;
+}
+
+pub const HidrawState = enum { missing, ok, denied };
+
+pub const VerdictInput = struct {
+    usb_present: bool,
+    claimed: bool,
+    hidraw: HidrawState,
+    kernel_driver: bool,
+    flagged_driver: bool,
+    shadow_grabs: usize,
+};
+
+pub const Verdict = enum {
+    not_detected,
+    ok_managed,
+    managed_unguarded_shadow,
+    permission_denied,
+    shadowed_no_hidraw,
+    no_hidraw,
+    present_not_claimed,
+};
+
+pub fn decideVerdict(in: VerdictInput) Verdict {
+    if (!in.usb_present) return .not_detected;
+    if (in.claimed) {
+        if (in.flagged_driver and in.shadow_grabs == 0) return .managed_unguarded_shadow;
+        return .ok_managed;
+    }
+    if (in.hidraw == .denied) return .permission_denied;
+    if (in.hidraw == .missing) {
+        return if (in.kernel_driver) .shadowed_no_hidraw else .no_hidraw;
+    }
+    return .present_not_claimed;
+}
+
+/// Entry for vid:pid, preferring a readable node over an access-denied one
+/// when the device exposes several hidraw nodes with mixed permissions.
+pub fn pickScanEntry(entries: []const scan.ScanEntry, vid: u16, pid: u16) ?scan.ScanEntry {
+    var denied: ?scan.ScanEntry = null;
+    for (entries) |e| {
+        if (e.vid != vid or e.pid != pid) continue;
+        if (!e.access_denied) return e;
+        if (denied == null) denied = e;
+    }
+    return denied;
 }
 
 fn printSupportedDevices(allocator: std.mem.Allocator, status_devices: []const StatusDevice, exec_start: ?[]const u8, writer: anytype) !void {
@@ -402,8 +573,18 @@ fn printSupportedDevices(allocator: std.mem.Allocator, status_devices: []const S
     const scan_entries = scan.scan(allocator, scan_dir) catch null;
     defer if (scan_entries) |se| scan.freeEntries(allocator, se);
 
+    const daemon_dirs = resolveDaemonConfigDirs(allocator, exec_start) catch null;
+    defer if (daemon_dirs) |dd| paths.freeConfigDirs(allocator, dd);
+
     for (entries.items) |entry| {
         try writer.print("{s} (0x{x:0>4}:0x{x:0>4})\n", .{ entry.name, entry.vid, entry.pid });
+
+        const matches = if (daemon_dirs) |dd|
+            collectConfigMatches(allocator, dd, entry.vid, entry.pid) catch null
+        else
+            null;
+        defer if (matches) |ms| freeConfigMatches(allocator, ms);
+        if (matches) |ms| try printProvenance(writer, ms);
 
         const presence = probeUsbPresence(allocator, entry.vid, entry.pid, "") catch null;
         defer if (presence) |p| p.deinit(allocator);
@@ -425,50 +606,59 @@ fn printSupportedDevices(allocator: std.mem.Allocator, status_devices: []const S
             try writer.writeAll("  usb: (sysfs unavailable)\n");
         }
 
-        const hidraw_path: ?[]const u8 = blk: {
-            if (scan_entries) |se| {
-                for (se) |se_entry| {
-                    if (se_entry.vid == entry.vid and se_entry.pid == entry.pid) {
-                        break :blk se_entry.path;
-                    }
-                }
+        const hid_entry: ?scan.ScanEntry = if (scan_entries) |se|
+            pickScanEntry(se, entry.vid, entry.pid)
+        else
+            null;
+        const hidraw_state: HidrawState = if (hid_entry) |he|
+            (if (he.access_denied) .denied else .ok)
+        else
+            .missing;
+        try printHidrawDiagnosis(writer, if (hid_entry) |he| he.path else null, hidraw_state == .denied);
+
+        const claimed_sd: ?StatusDevice = blk: {
+            for (status_devices) |sd| {
+                if (sd.vid == entry.vid and sd.pid == entry.pid) break :blk sd;
             }
             break :blk null;
         };
-        if (hidraw_path) |p| {
-            try writer.print("  hidraw: {s}\n", .{p});
-        } else {
-            try writer.writeAll("  hidraw: none\n");
+        const claimed = claimed_sd != null;
+        try writer.print("  padctl: {s}\n", .{if (claimed) "CLAIMED" else "not claimed"});
+        if (claimed_sd) |sd| {
+            if (sd.shadow_grabs > 0) {
+                if (sd.shadow_nodes.len > 0) {
+                    try writer.print("  shadow nodes grabbed: {d} ({s})\n", .{ sd.shadow_grabs, sd.shadow_nodes });
+                } else {
+                    try writer.print("  shadow nodes grabbed: {d}\n", .{sd.shadow_grabs});
+                }
+            }
         }
 
-        const claimed = blk: {
-            for (status_devices) |sd| {
-                if (sd.vid == entry.vid and sd.pid == entry.pid) break :blk true;
-            }
-            break :blk false;
-        };
-        try writer.print("  padctl: {s}\n", .{if (claimed) "CLAIMED" else "not claimed"});
-
         if (presence) |p| {
-            if (!p.present) {
-                try writer.writeAll("  verdict: device not detected on USB\n");
-            } else if (claimed) {
-                try writer.writeAll("  verdict: OK — managed by padctl\n");
-            } else {
-                var any_driver: ?[]const u8 = null;
-                for (p.interfaces) |iface| {
-                    if (iface.driver != null) {
-                        any_driver = iface.driver;
-                        break;
-                    }
+            var any_driver: ?[]const u8 = null;
+            for (p.interfaces) |iface| {
+                if (iface.driver != null) {
+                    any_driver = iface.driver;
+                    break;
                 }
-                if (any_driver != null and hidraw_path == null) {
-                    try writer.print("  verdict: device present but shadowed by '{s}' and no hidraw node\n", .{any_driver.?});
-                } else if (hidraw_path == null) {
-                    try writer.writeAll("  verdict: USB present but no hidraw node — check udev rules or group membership\n");
-                } else {
-                    try writer.writeAll("  verdict: hidraw present but not claimed — daemon down or device not in active mapping\n");
-                }
+            }
+            const flagged = findFlaggedShadow(p.interfaces, entry.block_kernel_drivers);
+            const verdict = decideVerdict(.{
+                .usb_present = p.present,
+                .claimed = claimed,
+                .hidraw = hidraw_state,
+                .kernel_driver = any_driver != null,
+                .flagged_driver = flagged != null,
+                .shadow_grabs = if (claimed_sd) |sd| sd.shadow_grabs else 0,
+            });
+            switch (verdict) {
+                .not_detected => try writer.writeAll("  verdict: device not detected on USB\n"),
+                .ok_managed => try writer.writeAll("  verdict: OK — managed by padctl\n"),
+                .managed_unguarded_shadow => try writer.print("  verdict: WARNING — kernel driver '{s}' bound on {s} but no shadow grab held\n", .{ flagged.?.driver.?, flagged.?.iface }),
+                .permission_denied => try writer.writeAll("  verdict: hidraw node exists but permission denied — fix group membership (see hint above)\n"),
+                .shadowed_no_hidraw => try writer.print("  verdict: device present but shadowed by '{s}' and no hidraw node\n", .{any_driver.?}),
+                .no_hidraw => try writer.writeAll("  verdict: USB present but no hidraw node — check udev rules or group membership\n"),
+                .present_not_claimed => try writer.writeAll("  verdict: hidraw present but not claimed — daemon down or device not in active mapping\n"),
             }
         }
 
